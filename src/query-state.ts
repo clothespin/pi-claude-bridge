@@ -53,6 +53,14 @@ export class QueryContext {
 	 *  supply an id.
 	 */
 	piSessionId: string | null = null;
+	/** Fingerprint of the start snapshot this query was built from. Delivery
+	 *  compares the incoming prefix against this to detect a context transform
+	 *  rewrite before routing a tool result into a parked query. */
+	historyDigest: string | null = null;
+	/** Fingerprint of the full non-system context at the most recent tool-result
+	 *  delivery. Session completion uses this for the mirror's cursor digest,
+	 *  since the provider call's `context` closure is the query-start snapshot. */
+	deliveredDigest: string | null = null;
 	/** pi rewrote the history this query was built from (session_compact,
 	 *  session_tree in its own pi session). Set by markRebuildForSession, consumed
 	 *  by the tool-result delivery that discards the query. Not session-wide state:
