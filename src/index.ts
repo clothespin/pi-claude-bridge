@@ -1851,38 +1851,23 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 
 	// A context transform (ACP compaction/rewrite) can replace history while this
-	// query is parked. The query was opened over the digest stored at its start;
-	// compare the conversation before this tool delivery against it. Tool results,
-	// the assistant tool call they answer, and anything after the result (steers
-	// added while the turn was parked) are not part of that start snapshot.
-	if (resultCtx) {
-		const turnIds = new Set(resultCtx.turnToolCallIds);
-		let deliveryStart = context.messages.length;
-		for (let i = 0; i < context.messages.length; i++) {
-			const m = context.messages[i];
-			if (m.role === "toolResult" && turnIds.has(m.toolCallId)) {
-				deliveryStart = i;
-				break;
-			}
-		}
-		const incomingHistory = nonSystemMessages(context.messages.slice(0, deliveryStart)).filter((m) => {
-			// The assistant message that issued this turn's tool calls was produced
-			// by the parked query, so it is not part of the snapshot the query was
-			// built from. Earlier tool results are: they were present at query start.
-			if (m.role === "assistant" && Array.isArray(m.content)) {
-				return !m.content.some((b) => b.type === "toolCall" && turnIds.has(b.id));
-			}
-			return true;
-		});
-		const snapshotDigest = historyFingerprint(incomingHistory);
+	// query is parked. The query was opened over the snapshot stored at its start;
+	// compare that same prefix of the incoming conversation against it. Everything
+	// after the prefix was appended while the query ran: its own tool calls and
+	// results from every earlier round, and steers added while it was parked.
+	//
+	// The query still keeps the turn. Discarding it would resume a rebuilt session
+	// that ends in this tool result, and Claude Code answers such a resume with a
+	// synthetic "No response requested." turn. The mirror rebuilds from the
+	// rewritten history at the next fresh query instead, which ends at a reply.
+	if (resultCtx && !resultCtx.rebuildAfterTurn) {
+		const incoming = nonSystemMessages(context.messages);
+		const snapshotDigest = incoming.length >= resultCtx.historyLength
+			? historyFingerprint(incoming.slice(0, resultCtx.historyLength))
+			: null;
 		if (snapshotDigest !== resultCtx.historyDigest) {
-			resultCtx.historyStale = true;
-			debug(`provider: context transform rewrote history under parked query (msgs=${context.messages.length})`);
-		} else {
-			// Keep the query's snapshot digest, not the delivered full context:
-			// a second tool result in this same turn is compared against the same
-			// start snapshot, with this result likewise excluded.
-			resultCtx.historyDigest = snapshotDigest;
+			resultCtx.rebuildAfterTurn = true;
+			debug(`provider: context transform rewrote history under parked query (msgs=${context.messages.length}, snapshot=${resultCtx.historyLength}), rebuilding after this turn`);
 		}
 	}
 
@@ -1935,6 +1920,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		if (state) {
 			state.cursor = context.messages.length;
 			state.historyDigest = deliveredDigest;
+			if (resultCtx.rebuildAfterTurn) state.needsRebuild = true;
 		}
 		resultCtx.deliveredDigest = deliveredDigest;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
@@ -2050,6 +2036,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// from the set, not from here) and re-discard a healthy query.
 	queryCtx.historyStale = false;
 	queryCtx.missedSteer = false;
+	queryCtx.rebuildAfterTurn = false;
 	queryCtx.deliveredDigest = null;
 
 	const cwd = sessionCwdFor(options?.sessionId);
@@ -2070,6 +2057,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// The full context this provider call serves (including the current prompt),
 	// for detecting a later transform rewrite before a parked tool result.
 	queryCtx.historyDigest = historyFingerprint(context.messages);
+	queryCtx.historyLength = context.messages.length;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
@@ -2274,9 +2262,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				if (sessionId) {
 					const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
 					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-					// A missed steer may precede the first mirror or arrive while this
-					// query is still able to complete. Preserve both rebuild signals.
-					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, historyDigest: queryCtx.deliveredDigest ?? historyFingerprint(context.messages), needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
+					// A missed steer or a transform rewrite may precede the first mirror
+					// or arrive while this query is still able to complete. Preserve
+					// every rebuild signal.
+					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, historyDigest: queryCtx.deliveredDigest ?? historyFingerprint(context.messages), needsRebuild: queryCtx.missedSteer || queryCtx.rebuildAfterTurn || state?.needsRebuild });
 				}
 			}
 

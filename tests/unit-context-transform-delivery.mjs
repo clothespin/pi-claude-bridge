@@ -1,9 +1,10 @@
 /**
  * A context transform can rewrite the history while a Claude Code query is
  * parked at a tool boundary. Tool-result delivery never calls
- * syncSharedSession, so the parked query would otherwise answer over the old
+ * syncSharedSession, so the session mirror would otherwise keep the old
  * conversation. Compare the incoming conversation before delivery against the
- * digest recorded at query start and discard the stale query.
+ * digest recorded at query start, let the query finish its turn, and rebuild
+ * the mirror at the next fresh query.
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -96,27 +97,34 @@ beforeEach(() => {
 afterEach(() => setQuery(null));
 
 describe("context transform while a query is parked", () => {
-	it("discards the parked query and answers from the rewritten history", async () => {
-		scripts.push({ label: "parked", steps: [init("cc-old"), ...toolUse("call_1"), ...textStart, (killed) => killed] });
+	it("keeps the parked query through a rewrite and rebuilds after the turn", async () => {
+		let releaseReply;
+		const resultDelivered = new Promise((r) => { releaseReply = r; });
+		scripts.push({ label: "parked", steps: [init("cc-old"), ...toolUse("call_1"), () => resultDelivered, ...text("answered"), result("answered")] });
 		const first = streamSimple(model, { messages: [user("Original question")], tools }, { sessionId: "pi-acp" });
 		await settle();
 		const firstReply = await first.result();
 		assert.equal(firstReply.stopReason, "toolUse", "precondition: the query stayed parked at the tool call");
 		assert.equal(activeQueryContexts.size, 1, "precondition: one live context owns the call");
 
-		scripts.push({ label: "rebuilt", steps: [init("cc-new"), ...text("continued"), result("continued")] });
-		const reply = await streamSimple(model, {
-			messages: [
-				user("Rewritten summary"),
-				toolCall("call_1"),
-				toolResult("call_1"),
-			],
-			tools,
-		}, { sessionId: "pi-acp" }).result();
+		// Discarding the query here would resume a rebuilt session ending in this
+		// tool result, which Claude Code answers with "No response requested."
+		const rewritten = [user("Rewritten summary"), toolCall("call_1"), toolResult("call_1")];
+		const second = streamSimple(model, { messages: rewritten, tools }, { sessionId: "pi-acp" });
+		releaseReply();
+		const reply = await second.result();
+		assert.equal(calls.length, 1, "the parked query keeps the turn");
+		assert.equal(replyText(reply), "answered", "the turn completes on the parked query");
+		await settle();
+		assert.equal(mod.__test.getSharedSession("pi-acp")?.needsRebuild, true, "the mirror rebuilds at the next fresh query");
 
-		assert.equal(calls.length, 2, "the stale query is discarded and a fresh query starts");
-		assert.match(calls[1].prompt, /context was compacted/, "the replacement says the history was rewritten");
-		assert.equal(replyText(reply), "continued", "the rewritten turn completes");
+		scripts.push({ label: "next", steps: [init("cc-next"), ...text("next"), result("next")] });
+		const answered = { ...toolCall("x"), content: [{ type: "text", text: "answered" }], stopReason: "stop" };
+		await streamSimple(model, { messages: [...rewritten, answered, user("Next question")], tools }, { sessionId: "pi-acp" }).result();
+		assert.equal(calls.length, 2, "the next prompt starts a fresh query");
+		assert.equal(calls[1].prompt, "Next question", "the fresh query carries the real prompt, not a continuation marker");
+		assert.ok(calls[1].resume, "the fresh query resumes the rebuilt session");
+		assert.notEqual(mod.__test.getSharedSession("pi-acp")?.needsRebuild, true, "the rebuild consumed the mark");
 	});
 
 	it("does not treat an earlier tool result as a context rewrite", async () => {
@@ -175,5 +183,30 @@ describe("context transform while a query is parked", () => {
 		await streamSimple(model, { messages: history, tools }, { sessionId: "pi-acp" });
 		await settle();
 		assert.equal(calls.length, 1, "the second result must not be compared against the delivered context");
+	});
+
+	it("does not treat the query's own earlier tool round as a rewrite", async () => {
+		let releaseRound2;
+		const round1Delivered = new Promise((r) => { releaseRound2 = r; });
+		scripts.push({ label: "parked", steps: [init("cc-old"), ...toolUse("call_1"), () => round1Delivered, ...toolUse("call_2"), ...textStart, (killed) => killed] });
+		scripts.push({ label: "fallback", steps: [init("cc-new"), ...text("fallback"), result("fallback")] });
+
+		const first = streamSimple(model, { messages: [user("Question")], tools }, { sessionId: "pi-acp" });
+		await settle();
+		assert.equal((await first.result()).stopReason, "toolUse", "precondition: the query parked on round 1");
+
+		const history = [user("Question"), toolCall("call_1"), toolResult("call_1"), toolCall("call_2"), toolResult("call_2")];
+		const second = streamSimple(model, { messages: history.slice(0, 3), tools }, { sessionId: "pi-acp" });
+		releaseRound2();
+		await settle();
+		assert.equal((await second.result()).stopReason, "toolUse", "precondition: the query parked on round 2");
+		assert.equal(calls.length, 1, "round 1 stays on the parked query");
+
+		// Round 2's delivery carries round 1's call and result, which this query
+		// produced after its start snapshot: they are not a rewrite.
+		await streamSimple(model, { messages: history, tools }, { sessionId: "pi-acp" });
+		await settle();
+		assert.equal(calls.length, 1, "round 2 must not discard the query and rebuild");
+		assert.equal(activeQueryContexts.size, 1, "the parked query still owns the turn");
 	});
 });

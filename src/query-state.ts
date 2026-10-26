@@ -57,6 +57,9 @@ export class QueryContext {
 	 *  compares the incoming prefix against this to detect a context transform
 	 *  rewrite before routing a tool result into a parked query. */
 	historyDigest: string | null = null;
+	/** Message count of that start snapshot: the prefix delivery fingerprints.
+	 *  Everything after it was appended while the query ran. */
+	historyLength = 0;
 	/** Fingerprint of the full non-system context at the most recent tool-result
 	 *  delivery. Session completion uses this for the mirror's cursor digest,
 	 *  since the provider call's `context` closure is the query-start snapshot. */
@@ -71,6 +74,10 @@ export class QueryContext {
 	/** A steer never reached CC. A first query has no session mirror yet, so
 	 *  completion must carry this into the mirror it creates. */
 	missedSteer = false;
+	/** A context transform rewrote the history under this query. The query still
+	 *  finishes the turn; completion carries this into the mirror so the next
+	 *  fresh query rebuilds from the rewritten history. */
+	rebuildAfterTurn = false;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
